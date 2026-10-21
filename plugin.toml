@@ -1,0 +1,12 @@
+# Manifest for the maki package in this repository.
+#
+# The companion providers in plugin/ talk to the OpenCode Go gateway only.
+# `net` is required to reach it, `net_hosts` pins egress to that host, and
+# `env` is required because the auth hook falls back to OPENCODE_API_KEY
+# when no stored credentials resolve for a slug.
+min_maki_version = "0.6.0"
+
+[permissions]
+net = true
+env = true
+net_hosts = ["opencode.ai"]
