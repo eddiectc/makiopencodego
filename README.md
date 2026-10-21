@@ -9,20 +9,29 @@ this package registers one companion provider per wire format. Use
 `opencode-go-<route>/<model>` where you would have used
 `opencode-go/<model>`; everything else stays on the built-in provider.
 
-| Slug | Route | Models |
+| Slug | Route | Families |
 | ---- | ----- | ------ |
-| `opencode-go-chat` | `/chat/completions` | `deepseek-v4.1-flash`, `deepseek-v4-pro`, `glm-5.3-flash` |
-| `opencode-go-responses` | `/responses` | `grok-4.7`, `grok-4.6`, `gpt-6-luna`, `gpt-5.6-luna`, `muse-spark-1.3-contributor` |
-| `opencode-go-gemini` | Gemini native | `gemini-4-argon-contributor` |
-| `opencode-go-anthropic` | `/v1/messages` | `claude-haiku-5-5`, `minimax-m3`, `qwen3.8-max`, `qwen3.8-flash`, `qwen3.7-plus` |
+| `opencode-go-chat` | `/chat/completions` | `deepseek-*`, `glm-*`, plus `minimax-m3.1-flash-free` |
+| `opencode-go-responses` | `/responses` | `grok-*`, `gpt-*`, `muse-spark-*` |
+| `opencode-go-gemini` | Gemini native | `gemini-*` |
+| `opencode-go-anthropic` | `/v1/messages` | `claude-*`, `qwen*`, `minimax-*` except `minimax-m3.1-flash-free` |
+
+Each slug lists its families live from the gateway catalogue, so a new
+sibling (a future `grok-4.8`) appears without a package update. Ids outside
+these families (`kimi-*`, `mimo-*`, `longcat-*`, `hy*`, `step-*`,
+`beam-*`, `omen-alpha`, …) stay on the built-in `opencode-go` provider and
+are hidden from the companions.
 
 Beyond routing, the chat provider unlocks the full `reasoning_effort` ladder
 (`minimal`–`max`, plus a working off) that the built-in catalog path cannot
-express, and each provider pins the model picker to the models it actually
-shapes so a chat model can never be posted to `/responses` by mistake.
+express, and each provider filters the model picker to the families it
+actually shapes so a chat model can never be posted to `/responses` by
+mistake.
 Pricing mirrors the Go usage table; where the gateway charges more above a
 context threshold, the declared window sits at the threshold so compaction
-keeps requests inside the cheap tier. The full rationale is documented in
+keeps requests inside the cheap tier. Models with no published rate yet (a
+new launch, or an id missing from models.dev) show no cost estimate until
+their row is curated. The full rationale is documented in
 `plugin/opencode_go.lua`.
 
 Upstream issue: https://github.com/tontinton/maki/issues/1091

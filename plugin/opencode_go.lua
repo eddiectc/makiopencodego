@@ -49,6 +49,12 @@ local ZEN_BASE_URL = "https://opencode.ai/zen/go/v1"
 local GEMINI_BASE_URL = "https://opencode.ai/inference/go/v1"
 local ANTHROPIC_BASE_URL = "https://opencode.ai/inference/go/anthropic"
 
+-- Live catalogue for the `list_models` hooks: id-only, unauthenticated.
+-- Absolute URL on purpose — the anthropic origin 404s a relative `/v1/models`
+-- (its path root is `/anthropic`, not `/v1`), so building from ctx.base_url
+-- would break that slug's listing.
+local CATALOG_URL = "https://opencode.ai/inference/go/v1/models"
+
 local function pricing(p)
   return { input = p[1], output = p[2], cache_write = p[3], cache_read = p[4] }
 end
@@ -111,11 +117,168 @@ local auth_bearer = make_auth(nil)
 local auth_google = make_auth("x-goog-api-key")
 local auth_anthropic = make_auth("x-api-key")
 
--- Each provider pins the picker to the models it actually shapes; see the
--- per-slug comment at the `list_models` call site for what goes wrong
--- without the pin.
-local function pin(rows)
-  return function() return rows end
+-- Family routing: which gateway ids each slug lists.
+--
+-- An id belongs to a slug when it starts with one of the slug's literal
+-- prefixes, plus/minus one exact-id exception: `minimax-m3.1-flash-free` is
+-- chat-route while the rest of `minimax-` is Anthropic-route. Anything else
+-- (kimi-, mimo-, longcat-, hy, step-, beam-, omen-alpha, …) is hidden from
+-- all four slugs and stays on the built-in `opencode-go` provider.
+local CHAT_EXCEPTION = "minimax-m3.1-flash-free"
+
+local SLUG_RULES = {
+  ["opencode-go-chat"] = {
+    prefixes = { "deepseek-", "glm-" },
+    include = { [CHAT_EXCEPTION] = true },
+    thinking = true,
+  },
+  ["opencode-go-responses"] = {
+    prefixes = { "grok-", "gpt-", "muse-spark-" },
+  },
+  ["opencode-go-gemini"] = {
+    prefixes = { "gemini-" },
+    thinking = true,
+  },
+  ["opencode-go-anthropic"] = {
+    prefixes = { "claude-", "qwen", "minimax-" },
+    exclude = { [CHAT_EXCEPTION] = true },
+    thinking = true,
+  },
+}
+
+-- Fallback description for a gateway id no curated row names yet (a future
+-- `grok-4.8`): the family's default tier and flagship-typical windows and
+-- vision. Deliberately no pricing — an unpriced model renders cost-unknown,
+-- never $0 — and no cheap-tier cap, which is curated per id once its
+-- threshold is known (cf. grok-4.7 below). Fields: tier, context_window,
+-- max_output_tokens, supports_vision.
+local FAMILY_GUESS = {
+  ["deepseek-"] = { "medium", 1000000, 384000, false },
+  ["glm-"] = { "medium", 1000000, 131072, false },
+  ["grok-"] = { "strong", 500000, 131072, true },
+  ["gpt-"] = { "weak", 1050000, 128000, true },
+  ["muse-spark-"] = { "strong", 1048576, 131072, true },
+  ["gemini-"] = { "strong", 1048576, 65536, true },
+  ["claude-"] = { "medium", 1000000, 128000, true },
+  ["qwen"] = { "medium", 1000000, 131072, true },
+  ["minimax-"] = { "medium", 1000000, 131072, true },
+}
+
+-- One curated table per slug drives both the static `models` rows and the
+-- offline `list_models` fallback, so the two can never disagree. Spec fields:
+-- id, tier, family, context_window, max_output_tokens, supports_vision,
+-- pricing { input, output, cache_write, cache_read } per 1M tokens or nil.
+-- Static rows stay exact-id: maki unions every static prefix into the picker,
+-- so a family prefix there would list a bogus `slug/grok-` spec. `thinking`
+-- marks rows that keep `supports_thinking`; responses omits it as before.
+local function build_models(specs, opts)
+  local rows, listed, by_id = {}, {}, {}
+  for i, s in ipairs(specs) do
+    local id, tier, family, context, out, vision, price = s[1], s[2], s[3], s[4], s[5], s[6], s[7]
+    local row = {
+      prefixes = { id },
+      tier = tier,
+      family = family,
+      context_window = context,
+      max_output_tokens = out,
+      supports_vision = vision,
+    }
+    if opts.requires_thinking then
+      row.requires_thinking = true
+    elseif opts.thinking then
+      row.supports_thinking = true
+    end
+    if price then
+      row.pricing = pricing(price)
+    end
+    if id == opts.default_id then
+      row.default = true
+    end
+    rows[i] = row
+    local info = {
+      id = id,
+      tier = tier,
+      context_window = context,
+      max_output_tokens = out,
+      supports_vision = vision,
+    }
+    if opts.thinking then
+      info.supports_thinking = true
+    end
+    if price then
+      info.pricing = pricing(price)
+    end
+    listed[i] = info
+    by_id[id] = info
+  end
+  return rows, listed, by_id
+end
+
+local function rule_matches(rule, id)
+  if rule.exclude and rule.exclude[id] then
+    return false
+  end
+  if rule.include and rule.include[id] then
+    return true
+  end
+  for _, p in ipairs(rule.prefixes) do
+    if id:sub(1, #p) == p then
+      return true
+    end
+  end
+  return false
+end
+
+-- Longest matching prefix wins, as it does for a model table row.
+local function guess_for(prefixes, id)
+  local best = nil
+  for _, p in ipairs(prefixes) do
+    if id:sub(1, #p) == p and (best == nil or #p > #best) then
+      best = p
+    end
+  end
+  return best and FAMILY_GUESS[best] or nil
+end
+
+-- Lists the slug's slice of the live gateway catalogue. Known ids re-emit
+-- their curated row; unknown same-family ids get the family guess (no
+-- pricing: cost-unknown until curated). On any fetch or shape failure the
+-- hook warns and returns the slug's curated ids, so the picker works offline.
+local function make_list_models(slug, by_id, fallback)
+  local rule = SLUG_RULES[slug]
+  return function(ctx)
+    local body, err = ctx.get_json(CATALOG_URL)
+    local data = type(body) == "table" and body.data or nil
+    if type(data) ~= "table" then
+      maki.log.warn(slug .. ": gateway catalogue unreachable (" .. tostring(err) .. "); listing " .. #fallback .. " curated models")
+      return fallback
+    end
+    local out, seen = {}, {}
+    for _, m in ipairs(data) do
+      local id = type(m) == "table" and m.id or nil
+      if type(id) == "string" and not seen[id] and rule_matches(rule, id) then
+        seen[id] = true
+        local known = by_id[id]
+        if known then
+          out[#out + 1] = known
+        else
+          local info = { id = id, tier = "medium" }
+          local g = guess_for(rule.prefixes, id)
+          if g then
+            info.tier = g[1]
+            info.context_window = g[2]
+            info.max_output_tokens = g[3]
+            info.supports_vision = g[4]
+          end
+          if rule.thinking then
+            info.supports_thinking = true
+          end
+          out[#out + 1] = info
+        end
+      end
+    end
+    return out
+  end
 end
 
 ----------------------------------------------------------------------------
@@ -153,41 +316,27 @@ end
 -- Upstream issues: https://github.com/tontinton/maki/issues/1091
 --                  https://github.com/anomalyco/opencode/issues/48180
 
--- id, tier, context_window, max_output_tokens, vision,
+-- id, tier, family, context_window, max_output_tokens, vision,
 -- pricing = { input, output, cache_write, cache_read } in USD per 1M tokens.
--- Values mirror models.dev.
+-- Values mirror models.dev. `minimax-m3.1-flash-free` is the family exception
+-- (chat-route, priced $0 — it really is free); `glm-5.1` has no models.dev
+-- entry yet, so it carries sibling-typical windows and no price.
 local CHAT_MODELS = {
-  { "deepseek-v4.1-flash", "medium", 1000000, 384000, true, { 0.15, 0.6, 0.0, 0.003 } },
-  { "deepseek-v4-pro", "strong", 1000000, 384000, false, { 0.66, 1.98, 0.0, 0.022 } },
-  { "glm-5.3-flash", "medium", 1000000, 131072, true, { 0.15, 0.5, 0.0, 0.003 } },
+  { "deepseek-v4.1-flash", "medium", "generic", 1000000, 384000, true, { 0.15, 0.6, 0.0, 0.003 } },
+  { "deepseek-v4-pro", "strong", "generic", 1000000, 384000, false, { 0.66, 1.98, 0.0, 0.022 } },
+  { "glm-5.3-flash", "medium", "generic", 1000000, 131072, true, { 0.15, 0.5, 0.0, 0.03 } },
+  { "glm-5.1", "medium", "generic", 1000000, 131072, false, nil },
+  { "glm-5.2", "strong", "generic", 1000000, 131072, false, { 1.4, 4.4, 0.0, 0.26 } },
+  { "glm-5.3", "strong", "generic", 1000000, 131072, false, { 1.4, 4.4, 0.0, 0.26 } },
+  { "minimax-m3.1-flash-free", "medium", "generic", 1000000, 512000, true, { 0.0, 0.0, 0.0, 0.0 } },
 }
 
-local chat_rows = {}
-local chat_listed = {}
-for i, m in ipairs(CHAT_MODELS) do
-  local id, tier, context, out, vision, price = m[1], m[2], m[3], m[4], m[5], m[6]
-  chat_rows[i] = {
-    prefixes = { id },
-    tier = tier,
-    family = "generic",
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    -- Keeps the picker offering the full ladder even though the wire below is
-    -- what decides which levels are actually meaningful.
-    supports_thinking = true,
-    pricing = pricing(price),
-    default = i == 1,
-  }
-  chat_listed[i] = {
-    id = id,
-    tier = tier,
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    pricing = pricing(price),
-  }
-end
+-- Keeps the picker offering the full ladder even though the wire below is
+-- what decides which levels are actually meaningful.
+local chat_rows, chat_listed, chat_by_id = build_models(CHAT_MODELS, {
+  thinking = true,
+  default_id = "deepseek-v4.1-flash",
+})
 
 -- Mirrors the bundled `deepseek` plugin's back-fill: the gateway rejects a
 -- thinking request with tool calls when an assistant message is missing
@@ -213,13 +362,13 @@ maki.provider.register({
   default_model = "deepseek-v4.1-flash",
   family = "generic",
   models = chat_rows,
-  -- Without this pin maki lists the gateway's whole catalogue under this
-  -- slug, including the responses-only models (grok, gpt-6-luna, muse-spark)
-  -- and the Gemini-native model that the gateway rejects on
-  -- /chat/completions, and would route non-DeepSeek models through the
-  -- DeepSeek-oriented thinking dialect below. Pin the picker to the chat
-  -- models this provider actually shapes.
-  list_models = pin(chat_listed),
+  -- Without this filter maki lists the gateway's whole catalogue under this
+  -- slug, including the responses-only models (grok, gpt-*, muse-spark) and
+  -- the Gemini-native model that the gateway rejects on /chat/completions.
+  -- The hook lists only the deepseek-/glm- families plus the minimax
+  -- exception, so a future `glm-5.4` appears without a code change while an
+  -- id from another family can never be posted to the wrong route.
+  list_models = make_list_models("opencode-go-chat", chat_by_id, chat_listed),
   -- `gpt-5-6` is used only as a wire shape (the reasoning_effort literal set and
   -- off = "none"), not as a GPT model claim; the gateway accepts the full set.
   openai = { thinking = { dialect = "gpt-5-6" } },
@@ -259,41 +408,25 @@ maki.provider.register({
 -- Values mirror models.dev; the gateway charges more above a context
 -- threshold, which maki's flat per-model pricing cannot express, so the
 -- quoted baseline (<= threshold) rate is used. Where the threshold is real
--- money (grok: 200k), context_window is declared at the threshold so maki's
--- compaction keeps every request inside the cheap tier.
+-- money, context_window is declared at the threshold so maki's compaction
+-- keeps every request inside the cheap tier. `grok-4.6` has no models.dev
+-- entry; its row keeps the last published grok baseline.
 local RESPONSES_MODELS = {
   -- 200k, not the model's 500k: the gateway only honours $2/$6 up to a 200k
   -- context. maki compacts at 80% of the window, so requests stay ~160k.
+  -- The cap lives on grok-4.7's own row, not the family guess: a future grok
+  -- id gets the full window until its threshold is known.
   { "grok-4.7", "strong", "generic", 200000, 131072, true, { 2.0, 6.0, 0.0, 0.5 } },
   { "grok-4.6", "strong", "generic", 500000, 131072, true, { 2.0, 6.0, 0.0, 0.5 } },
   { "gpt-6-luna", "weak", "gpt", 1050000, 128000, true, { 0.1, 0.5, 0.125, 0.01 } },
   { "gpt-5.6-luna", "weak", "gpt", 1050000, 128000, true, { 0.2, 1.2, 0.25, 0.02 } },
   { "muse-spark-1.3-contributor", "strong", "generic", 1048576, 131072, true, { 0.1, 0.2, 0.0, 0.002 } },
+  { "muse-spark-1.2-contributor", "strong", "generic", 1048576, 131072, true, { 0.1, 0.2, 0.0, 0.002 } },
 }
 
-local responses_rows = {}
-local responses_listed = {}
-for i, m in ipairs(RESPONSES_MODELS) do
-  local id, tier, family, context, out, vision, price = m[1], m[2], m[3], m[4], m[5], m[6], m[7]
-  responses_rows[i] = {
-    prefixes = { id },
-    tier = tier,
-    family = family,
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    pricing = pricing(price),
-    default = i == 1,
-  }
-  responses_listed[i] = {
-    id = id,
-    tier = tier,
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    pricing = pricing(price),
-  }
-end
+local responses_rows, responses_listed, responses_by_id = build_models(RESPONSES_MODELS, {
+  default_id = "grok-4.7",
+})
 
 -- Reasoning effort on the Responses API.
 --
@@ -301,21 +434,24 @@ end
 -- refuses the `openai` wire (plugin.rs:384), so the effort has to be written to
 -- the body here. This mirrors maki's own `apply_responses_reasoning`
 -- (openai/responses.rs:46) and `Effort::snap` (maki-storage/src/sessions.rs:567),
--- using the built-in dialect for each model:
---   grok-4.6/4.7   -> "grok"     (low..xhigh; adaptive high; off omits — Grok
---                                cannot disable reasoning)
---   gpt-6-luna     -> "gpt-6"    (low..max; adaptive medium; off omits — `none`
---                                is rejected by GPT-6)
---   gpt-5.6-luna   -> "gpt-5-6"  (minimal..max; adaptive medium; off "none")
---   muse-spark-1.3 -> "standard" (minimal..max; adaptive medium; off omits)
+-- using the built-in dialect for each family (longest prefix wins, so
+-- `gpt-5.6-` beats the `gpt-` fallback):
+--   grok-        -> "grok"     (low..xhigh; adaptive high; off omits — Grok
+--                               cannot disable reasoning)
+--   gpt-6-       -> "gpt-6"    (low..max; adaptive medium; off omits — `none`
+--                               is rejected by GPT-6)
+--   gpt-5.6-     -> "gpt-5-6"  (minimal..max; adaptive medium; off "none")
+--   gpt-         -> "gpt-6"    (fallback for an unknown GPT: omitting `off`
+--                               is safer than sending `none` to it)
+--   muse-spark-  -> "standard" (minimal..max; adaptive medium; off omits)
 local LEVELS = { "minimal", "low", "medium", "high", "xhigh", "max" }
 
 local THINKING_DIALECTS = {
-  { prefix = "grok-4.7", supported = { low = true, medium = true, high = true, xhigh = true }, adaptive = "high" },
-  { prefix = "grok-4.6", supported = { low = true, medium = true, high = true, xhigh = true }, adaptive = "high" },
-  { prefix = "gpt-6-luna", supported = { low = true, medium = true, high = true, xhigh = true, max = true }, adaptive = "medium" },
-  { prefix = "gpt-5.6-luna", supported = { minimal = true, low = true, medium = true, high = true, xhigh = true, max = true }, adaptive = "medium", off = "none" },
-  { prefix = "muse-spark-1.3-contributor", supported = { minimal = true, low = true, medium = true, high = true, xhigh = true, max = true }, adaptive = "medium" },
+  { prefix = "grok-", supported = { low = true, medium = true, high = true, xhigh = true }, adaptive = "high" },
+  { prefix = "gpt-6-", supported = { low = true, medium = true, high = true, xhigh = true, max = true }, adaptive = "medium" },
+  { prefix = "gpt-5.6-", supported = { minimal = true, low = true, medium = true, high = true, xhigh = true, max = true }, adaptive = "medium", off = "none" },
+  { prefix = "gpt-", supported = { low = true, medium = true, high = true, xhigh = true, max = true }, adaptive = "medium" },
+  { prefix = "muse-spark-", supported = { minimal = true, low = true, medium = true, high = true, xhigh = true, max = true }, adaptive = "medium" },
 }
 
 -- Longest matching prefix wins, as it does for a model table row.
@@ -405,11 +541,15 @@ maki.provider.register({
   api_key_env = "OPENCODE_API_KEY",
   login_url = "https://opencode.ai/console",
   default_model = "grok-4.7",
+  -- Applies only to models without a row — every curated id above names its
+  -- own family, so this is just the guess for a future uncurated one, where
+  -- generic covers the grok/muse-spark majority.
+  family = "generic",
   models = responses_rows,
-  -- Without this pin maki lists the gateway's whole catalogue under this
+  -- Without this filter maki lists the gateway's whole catalogue under this
   -- slug, and the chat-completions models would be posted to /responses and
-  -- fail. The hook pins the picker to the responses-only models.
-  list_models = pin(responses_listed),
+  -- fail. The hook lists only the grok-/gpt-/muse-spark- families.
+  list_models = make_list_models("opencode-go-responses", responses_by_id, responses_listed),
   auth = auth_bearer,
   build_body = responses_build_body,
 })
@@ -476,7 +616,7 @@ maki.provider.register({
 -- per hard task, at ~100 tokens/s. Argon ignores temperature/top_p/top_k, so
 -- there is nothing to tune there.
 
--- id, tier, context_window, max_output_tokens, vision,
+-- id, tier, family, context_window, max_output_tokens, vision,
 -- pricing = { input, output, cache_write, cache_read } in USD per 1M tokens.
 -- Values mirror the Go usage table ($4/$20, $0.20 cached read with no write
 -- column; 1M shared input+output window; 64k single-response output cap —
@@ -484,38 +624,18 @@ maki.provider.register({
 -- the default cap is what agentic turns see).
 -- Every row requires thinking: Argon has no off switch (low/medium/high
 -- only, default medium), so `requires_thinking` drops "off" from the picker
--- and clamps it to minimal effort. It implies `supports_thinking`.
+-- and clamps it to minimal effort. It implies `supports_thinking`. (A future
+-- uncurated gemini- id gets plain `supports_thinking` from discovery until
+-- it gets its own row — the listing cannot express `requires_thinking`.)
 local GEMINI_MODELS = {
-  { "gemini-4-argon-contributor", "strong", 1048576, 65536, true, { 4.0, 20.0, 0.0, 0.2 } },
+  { "gemini-4-argon-contributor", "strong", "gemini", 1048576, 65536, true, { 4.0, 20.0, 0.0, 0.2 } },
 }
 
-local gemini_rows = {}
-local gemini_listed = {}
-for i, m in ipairs(GEMINI_MODELS) do
-  local id, tier, context, out, vision, price = m[1], m[2], m[3], m[4], m[5], m[6]
-  gemini_rows[i] = {
-    prefixes = { id },
-    tier = tier,
-    family = "gemini",
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    requires_thinking = true,
-    pricing = pricing(price),
-    default = i == 1,
-  }
-  gemini_listed[i] = {
-    id = id,
-    tier = tier,
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    -- ModelInfo cannot express `requires_thinking`; the declared row above
-    -- carries it, and this keeps the runtime listing honest about support.
-    supports_thinking = true,
-    pricing = pricing(price),
-  }
-end
+local gemini_rows, gemini_listed, gemini_by_id = build_models(GEMINI_MODELS, {
+  thinking = true,
+  requires_thinking = true,
+  default_id = "gemini-4-argon-contributor",
+})
 
 maki.provider.register({
   slug = "opencode-go-gemini",
@@ -527,11 +647,10 @@ maki.provider.register({
   default_model = "gemini-4-argon-contributor",
   family = "gemini",
   models = gemini_rows,
-  -- Without this pin maki lists the gateway's whole catalogue under this
+  -- Without this filter maki lists the gateway's whole catalogue under this
   -- slug, and the chat-completions and responses models would be posted to
-  -- the Gemini route and fail. The hook pins the picker to the Gemini-native
-  -- model.
-  list_models = pin(gemini_listed),
+  -- the Gemini route and fail. The hook lists only the gemini- family.
+  list_models = make_list_models("opencode-go-gemini", gemini_by_id, gemini_listed),
   auth = auth_google,
   -- NOTE: no `build_body` and no `openai` table — the google codec refuses
   -- both and registration would fail.
@@ -577,39 +696,27 @@ maki.provider.register({
 -- pricing = { input, output, cache_write, cache_read } in USD per 1M.
 -- Pricing is the Go-plan baseline (<= threshold) rate from the usage-limits
 -- table; windows/output/vision/tiers mirror the opencode2api census snapshot.
+-- `minimax-m2.5`, `qwen3.6-plus`, and `qwen3.7-max` have no models.dev entry
+-- yet: sibling-typical windows and vision, no price. qwen3.6-plus keeps the
+-- full 1M window — a sibling's cheap-tier cap is never inherited
+-- speculatively (cf. grok-4.6) — and the `-max` suffix promotes qwen3.7-max
+-- to strong, matching qwen3.8-max.
 local ANTHROPIC_MODELS = {
   { "claude-haiku-5-5", "medium", "claude", 100000, 100000, true, { 0.10, 0.50, 0.125, 0.01 } },
   { "minimax-m3", "medium", "generic", 1000000, 131072, true, { 0.30, 1.20, 0.0, 0.06 } },
+  { "minimax-m2.5", "medium", "generic", 204800, 131072, false, nil },
+  { "minimax-m2.7", "medium", "generic", 204800, 131072, false, { 0.3, 1.2, 0.375, 0.06 } },
   { "qwen3.8-max", "strong", "generic", 1000000, 131072, true, { 2.0, 6.0, 2.5, 0.25 } },
   { "qwen3.8-flash", "medium", "generic", 1000000, 131072, true, { 0.15, 0.47, 0.20, 0.016 } },
   { "qwen3.7-plus", "medium", "generic", 256000, 65536, true, { 0.40, 1.60, 0.50, 0.04 } },
+  { "qwen3.6-plus", "medium", "generic", 1000000, 65536, true, nil },
+  { "qwen3.7-max", "strong", "generic", 1000000, 131072, true, nil },
 }
 
-local anthropic_rows = {}
-local anthropic_listed = {}
-for i, m in ipairs(ANTHROPIC_MODELS) do
-  local id, tier, family, context, out, vision, price = m[1], m[2], m[3], m[4], m[5], m[6], m[7]
-  anthropic_rows[i] = {
-    prefixes = { id },
-    tier = tier,
-    family = family,
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    supports_thinking = true,
-    pricing = pricing(price),
-    default = i == 1,
-  }
-  anthropic_listed[i] = {
-    id = id,
-    tier = tier,
-    context_window = context,
-    max_output_tokens = out,
-    supports_vision = vision,
-    supports_thinking = true,
-    pricing = pricing(price),
-  }
-end
+local anthropic_rows, anthropic_listed, anthropic_by_id = build_models(ANTHROPIC_MODELS, {
+  thinking = true,
+  default_id = "claude-haiku-5-5",
+})
 
 maki.provider.register({
   slug = "opencode-go-anthropic",
@@ -619,12 +726,16 @@ maki.provider.register({
   api_key_env = "OPENCODE_API_KEY",
   login_url = "https://opencode.ai/console",
   default_model = "claude-haiku-5-5",
+  -- Applies only to models without a row — every curated id above names its
+  -- own family, so this is just the guess for a future uncurated one, where
+  -- generic covers the qwen/minimax majority.
+  family = "generic",
   models = anthropic_rows,
-  -- Without this pin the codec would GET the gateway's whole catalogue under
-  -- this slug, and the chat/responses/gemini models would be posted to
-  -- /v1/messages and fail. The hook pins the picker to the
-  -- Anthropic-route models.
-  list_models = pin(anthropic_listed),
+  -- Without this filter the codec would GET the gateway's whole catalogue
+  -- under this slug, and the chat/responses/gemini models would be posted
+  -- to /v1/messages and fail. The hook lists only the claude-/qwen/minimax-
+  -- families minus the chat-route minimax exception.
+  list_models = make_list_models("opencode-go-anthropic", anthropic_by_id, anthropic_listed),
   auth = auth_anthropic,
   -- NOTE: no `build_body` and no `openai` table — both are refused on this
   -- codec. Thinking is applied natively by `ThinkingConfig::apply_to_body`.
